@@ -27,6 +27,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	internalregistry "github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	responsesconverter "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/openai/responses"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	sdkopenai "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/openai"
@@ -2026,26 +2027,68 @@ func manifestRegistryModels(m *manifest) []*cliproxy.ModelInfo {
 	if m == nil {
 		return nil
 	}
-	ids := make([]string, 0, len(m.ModelIDs)+len(m.ModelAliases)*2)
-	ids = append(ids, m.ModelIDs...)
-	for _, alias := range m.ModelAliases {
-		ids = append(ids, alias.SourceModel, alias.Alias)
+	entries := make([]manifestRegistryModelEntry, 0, len(m.ModelIDs)+len(m.ModelAliases)*2)
+	seen := make(map[string]struct{}, cap(entries))
+	for _, id := range m.ModelIDs {
+		entries = appendManifestRegistryModelEntry(entries, seen, id, "")
 	}
-	ids = appendCodexInternalModels(ids)
-	ids = normalizeStringList(ids)
-	models := make([]*cliproxy.ModelInfo, 0, len(ids))
+	for _, alias := range m.ModelAliases {
+		entries = appendManifestRegistryModelEntry(entries, seen, alias.SourceModel, "")
+		entries = appendManifestRegistryModelEntry(entries, seen, alias.Alias, alias.SourceModel)
+	}
+	for _, id := range appendCodexInternalModels(nil) {
+		entries = appendManifestRegistryModelEntry(entries, seen, id, "")
+	}
+	models := make([]*cliproxy.ModelInfo, 0, len(entries))
 	now := time.Now().Unix()
-	for _, id := range ids {
-		models = append(models, &cliproxy.ModelInfo{
-			ID:          id,
-			Object:      "model",
-			Created:     now,
-			OwnedBy:     "openai",
-			Type:        "openai",
-			DisplayName: displayNameForModel(id),
-		})
+	for _, entry := range entries {
+		models = append(models, manifestRegistryModelInfo(entry.id, entry.source, now))
 	}
 	return models
+}
+
+type manifestRegistryModelEntry struct {
+	id     string
+	source string
+}
+
+func appendManifestRegistryModelEntry(entries []manifestRegistryModelEntry, seen map[string]struct{}, id string, source string) []manifestRegistryModelEntry {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return entries
+	}
+	key := strings.ToLower(id)
+	if _, exists := seen[key]; exists {
+		return entries
+	}
+	seen[key] = struct{}{}
+	return append(entries, manifestRegistryModelEntry{
+		id:     id,
+		source: strings.TrimSpace(source),
+	})
+}
+
+func manifestRegistryModelInfo(id string, source string, created int64) *cliproxy.ModelInfo {
+	info := &cliproxy.ModelInfo{
+		ID:          id,
+		Object:      "model",
+		Created:     created,
+		OwnedBy:     "openai",
+		Type:        "openai",
+		DisplayName: displayNameForModel(id),
+	}
+	lookupID := id
+	if source != "" {
+		lookupID = source
+	}
+	if staticInfo := internalregistry.LookupStaticModelInfo(lookupID); staticInfo != nil {
+		if staticInfo.Thinking != nil {
+			info.Thinking = staticInfo.Thinking
+		}
+		return info
+	}
+	info.UserDefined = true
+	return info
 }
 
 type sidecarRoundTripperProvider struct {

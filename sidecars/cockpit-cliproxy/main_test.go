@@ -14,6 +14,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
@@ -187,6 +190,131 @@ func TestSidecarRuntimeRegistersConfigCodexAPIKeyAuths(t *testing.T) {
 	if got := m.accountByAuthID[strings.ToLower(codexAPIKeyAuth.ID)]; got == nil || got.ID != "api-account" {
 		t.Fatalf("expected auth to be linked to manifest account, got %#v", got)
 	}
+}
+
+func TestManifestRegistryModelsPreservesStaticThinkingSupport(t *testing.T) {
+	models := manifestRegistryModels(&manifest{
+		ModelIDs: []string{"gpt-5.2"},
+	})
+
+	info := findModelInfoForTest(models, "gpt-5.2")
+	if info == nil {
+		t.Fatalf("expected gpt-5.2 in manifest registry models: %#v", models)
+	}
+	if info.Thinking == nil {
+		t.Fatalf("expected gpt-5.2 to preserve static thinking support: %#v", info)
+	}
+	if !stringSliceContains(info.Thinking.Levels, "high") {
+		t.Fatalf("expected gpt-5.2 thinking levels to include high: %#v", info.Thinking.Levels)
+	}
+	if info.UserDefined {
+		t.Fatalf("static model should not be marked user-defined: %#v", info)
+	}
+}
+
+func TestManifestRegistryModelsCopiesSourceThinkingToAliases(t *testing.T) {
+	models := manifestRegistryModels(&manifest{
+		ModelAliases: []modelAliasSpec{{
+			SourceModel: "gpt-5.2",
+			Alias:       "gpt-5.2-codex",
+			Fork:        true,
+		}},
+	})
+
+	alias := findModelInfoForTest(models, "gpt-5.2-codex")
+	if alias == nil {
+		t.Fatalf("expected alias in manifest registry models: %#v", models)
+	}
+	if alias.Thinking == nil {
+		t.Fatalf("expected alias to inherit source thinking support: %#v", alias)
+	}
+	if !stringSliceContains(alias.Thinking.Levels, "high") {
+		t.Fatalf("expected alias thinking levels to include high: %#v", alias.Thinking.Levels)
+	}
+	if alias.UserDefined {
+		t.Fatalf("alias backed by static source should not be marked user-defined: %#v", alias)
+	}
+}
+
+func TestManifestRegistryModelsTreatsUnknownModelsAsUserDefined(t *testing.T) {
+	models := manifestRegistryModels(&manifest{
+		ModelIDs: []string{"custom-codex-model"},
+	})
+
+	info := findModelInfoForTest(models, "custom-codex-model")
+	if info == nil {
+		t.Fatalf("expected custom model in manifest registry models: %#v", models)
+	}
+	if !info.UserDefined {
+		t.Fatalf("unknown manifest model should be user-defined so thinking passes upstream: %#v", info)
+	}
+	if info.Thinking != nil {
+		t.Fatalf("unknown manifest model should not invent thinking support: %#v", info)
+	}
+}
+
+func TestManifestRegisteredModelsPreserveReasoningEffortThroughThinkingPipeline(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "test-codex-auth",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	}
+	manager := buildCoreAuthManager(&config.Config{}, &cockpitSelector{}, nil)
+	registered, err := manager.Register(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	auth = registered
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	registerManifestModelsForAuth(manager, &manifest{
+		ModelIDs: []string{"gpt-5.2"},
+		ModelAliases: []modelAliasSpec{{
+			SourceModel: "gpt-5.2",
+			Alias:       "gpt-5.2-codex",
+		}},
+	}, auth)
+
+	for _, model := range []string{"gpt-5.2", "gpt-5.2-codex"} {
+		out, err := thinking.ApplyThinking(
+			[]byte(`{"model":"`+model+`","reasoning":{"effort":"high"}}`),
+			model,
+			"openai-response",
+			"codex",
+			"codex",
+		)
+		if err != nil {
+			t.Fatalf("ApplyThinking(%s): %v", model, err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(out, &payload); err != nil {
+			t.Fatalf("translated payload for %s should be JSON: %v", model, err)
+		}
+		reasoning, _ := payload["reasoning"].(map[string]any)
+		if reasoning["effort"] != "high" {
+			t.Fatalf("reasoning effort should survive manifest registry for %s: %s", model, out)
+		}
+	}
+}
+
+func findModelInfoForTest(models []*cliproxy.ModelInfo, id string) *cliproxy.ModelInfo {
+	for _, model := range models {
+		if model != nil && strings.EqualFold(model.ID, id) {
+			return model
+		}
+	}
+	return nil
+}
+
+func stringSliceContains(values []string, target string) bool {
+	for _, value := range values {
+		if strings.EqualFold(value, target) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestBuiltinTranslatorNormalizesOpenAIResponsesForCodex(t *testing.T) {
